@@ -1,0 +1,23 @@
+# Xcode & macOS
+.DS_Store
+xcuserdata/
+*.xcworkspace
+!default.xcworkspace
+*.xcuserdata
+*.xcuserdatad
+*.mode1v3
+*.mode2v3
+*.moved-aside
+*.xcuserstate
+*.xcbkptlist
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Fastlane / CocoaPods (if used downstream)
+Pods/
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
