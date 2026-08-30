@@ -47,8 +47,7 @@ Or add it to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/bhargavkukadiya/PhotoCaptureManager.git", branch: "main")
-    // Or pin to a release version (e.g. from: "1.0.0") once tagged
+    .package(url: "https://github.com/bhargavkukadiya/PhotoCaptureManager.git", from: "1.0.0")
 ]
 ```
 
