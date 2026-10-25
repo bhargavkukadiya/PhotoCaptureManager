@@ -3,9 +3,8 @@
 //
 // REQUIRED Info.plist keys:
 //   NSCameraUsageDescription
-//   NSPhotoLibraryAddUsageDescription   (iOS 11+, needed only if you save photos back to the library)
+//   NSPhotoLibraryUsageDescription   (only if your deployment target includes iOS 13)
 //
-// NSPhotoLibraryUsageDescription is only needed if you support iOS 13.
 // On iOS 14+, photo picking uses PHPickerViewController, which runs out-of-process
 // and requires NO library permission at all — do not request PHPhotoLibrary
 // authorization before presenting it, or you defeat its entire privacy benefit.
@@ -13,11 +12,14 @@
 // Minimum deployment target: iOS 13.0
 // (PHPickerViewController is used automatically on iOS 14+; UIImagePickerController
 // is used as the photo-library fallback on iOS 13.)
+//
+// Not available in app extensions: opening Settings uses `UIApplication.shared`.
 
 import UIKit
 import AVFoundation
 import Photos
 import PhotosUI
+import UniformTypeIdentifiers
 
 // MARK: - Result Type
 
@@ -36,6 +38,9 @@ public enum PhotoCaptureError: LocalizedError, Sendable {
     case permissionRestricted
     case imageExtractionFailed
     case requestAlreadyInProgress
+    /// UIKit refused to present the picker or alert, e.g. because the presenting view
+    /// controller is not in a window or is already presenting something else.
+    case presentationFailed
     case unknown(any Error & Sendable)
 
     public var errorDescription: String? {
@@ -50,6 +55,8 @@ public enum PhotoCaptureError: LocalizedError, Sendable {
             return "Could not extract an image from the selected item."
         case .requestAlreadyInProgress:
             return "Another photo capture request is already in progress."
+        case .presentationFailed:
+            return "The photo picker could not be presented."
         case .unknown(let error):
             return error.localizedDescription
         }
@@ -150,6 +157,60 @@ public struct PhotoCaptureConfiguration: Sendable {
     }
 }
 
+// MARK: - Environment
+
+/// The UIKit / AVFoundation side effects the manager depends on, so the request
+/// lifecycle can be unit tested.
+@MainActor
+struct PhotoCaptureEnvironment {
+    var isCameraAvailable: () -> Bool
+    var isCameraDeviceAvailable: (UIImagePickerController.CameraDevice) -> Bool
+    var cameraAuthorizationStatus: () -> AVAuthorizationStatus
+    var requestCameraAccess: @MainActor () async -> Bool
+    /// Presents `controller` from `presenter`, calling `onPresented` once it is on
+    /// screen. Returns `false` if the presentation can't happen.
+    var present: (
+        _ controller: UIViewController,
+        _ presenter: UIViewController,
+        _ onPresented: @escaping () -> Void
+    ) -> Bool
+    var dismiss: (_ controller: UIViewController, _ completion: @escaping () -> Void) -> Void
+    var openSettings: () -> Void
+
+    static var live: PhotoCaptureEnvironment {
+        PhotoCaptureEnvironment(
+            isCameraAvailable: { UIImagePickerController.isSourceTypeAvailable(.camera) },
+            isCameraDeviceAvailable: { UIImagePickerController.isCameraDeviceAvailable($0) },
+            cameraAuthorizationStatus: { AVCaptureDevice.authorizationStatus(for: .video) },
+            requestCameraAccess: { await AVCaptureDevice.requestAccess(for: .video) },
+            present: { controller, presenter, onPresented in
+                // UIKit only logs a warning when it refuses a presentation, so check its
+                // preconditions up front. `controller.presentingViewController` can't be
+                // checked afterwards: the pickers defer presentation until their UI is
+                // ready, leaving it nil when `present` returns.
+                guard presenter.viewIfLoaded?.window != nil,
+                      presenter.presentedViewController == nil,
+                      !presenter.isBeingDismissed else { return false }
+                presenter.present(controller, animated: true, completion: onPresented)
+                return true
+            },
+            dismiss: { controller, completion in
+                controller.dismiss(animated: true, completion: completion)
+            },
+            openSettings: {
+                guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                UIApplication.shared.open(url)
+            }
+        )
+    }
+}
+
+/// Lets a task-cancellation handler find the request it belongs to.
+@MainActor
+private final class RequestHandle {
+    var id: Int?
+}
+
 // MARK: - PhotoCaptureManager
 
 /// A production-ready singleton that handles camera capture and photo library
@@ -161,16 +222,39 @@ public final class PhotoCaptureManager: NSObject {
     // MARK: - Singleton
 
     public static let shared = PhotoCaptureManager()
-    private override init() { super.init() }
+
+    init(environment: PhotoCaptureEnvironment = .live) {
+        self.environment = environment
+        super.init()
+    }
 
     // MARK: - Public Configuration
 
     public var configuration = PhotoCaptureConfiguration()
 
+    /// Called with `true` when a picked photo starts loading after the picker has
+    /// closed (it may have to be downloaded from iCloud), and with `false` when
+    /// loading ends. Use it to show a progress indicator.
+    public var imageLoadingHandler: ((_ isLoading: Bool) -> Void)?
+
     // MARK: - Private State
 
+    private let environment: PhotoCaptureEnvironment
     private weak var presentingViewController: UIViewController?
+    /// The alert or picker presented for the active request, possibly still appearing.
+    private weak var activeController: UIViewController?
+    /// Whether `activeController` has finished appearing.
+    private var isActiveControllerPresented = false
+    /// Whether `activeController` is being dismissed.
+    private var isDismissingActiveController = false
+    /// Incremented per presentation, so a refusal check can tell whether it is still current.
+    private var presentationID = 0
     private var completion: ((PhotoCaptureResult) -> Void)?
+    /// Incremented per request, so late callbacks can tell whether their request is still active.
+    private var requestID = 0
+    /// Set while a cancelled request waits for its UI to be dismissed.
+    private var isCancelling = false
+    private var isLoadingImage = false
 
     // MARK: - Public Completion-Handler API
 
@@ -186,45 +270,8 @@ public final class PhotoCaptureManager: NSObject {
         anchor: PopoverAnchor? = nil,
         completion: @escaping (PhotoCaptureResult) -> Void
     ) {
-        guard self.completion == nil else {
-            completion(.failure(.requestAlreadyInProgress))
-            return
-        }
-        self.presentingViewController = viewController
-        self.completion = completion
-
-        let cameraAvailable = UIImagePickerController.isSourceTypeAvailable(.camera)
-
-        let sheet = UIAlertController(
-            title: configuration.strings.selectPhotoTitle,
-            message: nil,
-            preferredStyle: .actionSheet
-        )
-        sheet.view.tintColor = configuration.actionTintColor
-
-        if cameraAvailable {
-            sheet.addAction(UIAlertAction(title: configuration.strings.takePhotoAction, style: .default) { [weak self] _ in
-                self?.requestCameraAccess()
-            })
-        }
-
-        sheet.addAction(UIAlertAction(title: configuration.strings.chooseFromLibraryAction, style: .default) { [weak self] _ in
-            self?.requestPhotoLibraryAccess()
-        })
-
-        sheet.addAction(UIAlertAction(title: configuration.strings.cancelAction, style: .cancel) { [weak self] _ in
-            self?.finish(.cancelled)
-        })
-
-        // iPad popover anchor
-        if let popover = sheet.popoverPresentationController {
-            configurePopover(popover, anchor: anchor, fallbackIn: viewController.view)
-        }
-
-        // Catch interactive dismissal on iPad popover
-        sheet.presentationController?.delegate = self
-
-        viewController.present(sheet, animated: true)
+        guard beginRequest(from: viewController, completion: completion) != nil else { return }
+        showSourceOptions(anchor: anchor)
     }
 
     /// Convenience overload supporting `sourceView` directly for backward compatibility.
@@ -242,12 +289,7 @@ public final class PhotoCaptureManager: NSObject {
         from viewController: UIViewController,
         completion: @escaping (PhotoCaptureResult) -> Void
     ) {
-        guard self.completion == nil else {
-            completion(.failure(.requestAlreadyInProgress))
-            return
-        }
-        self.presentingViewController = viewController
-        self.completion = completion
+        guard beginRequest(from: viewController, completion: completion) != nil else { return }
         requestCameraAccess()
     }
 
@@ -256,27 +298,21 @@ public final class PhotoCaptureManager: NSObject {
         from viewController: UIViewController,
         completion: @escaping (PhotoCaptureResult) -> Void
     ) {
-        guard self.completion == nil else {
-            completion(.failure(.requestAlreadyInProgress))
-            return
-        }
-        self.presentingViewController = viewController
-        self.completion = completion
+        guard beginRequest(from: viewController, completion: completion) != nil else { return }
         requestPhotoLibraryAccess()
     }
 
     // MARK: - Modern Async / Await API
+    //
+    // Cancelling the calling task dismisses any UI the request has on screen and
+    // returns `.cancelled` once that dismissal has finished.
 
     /// Presents a source-selection action sheet asynchronously.
     public func presentPhotoOptions(
         from viewController: UIViewController,
         anchor: PopoverAnchor? = nil
     ) async -> PhotoCaptureResult {
-        await withCheckedContinuation { continuation in
-            presentPhotoOptions(from: viewController, anchor: anchor) { result in
-                continuation.resume(returning: result)
-            }
-        }
+        await performRequest(from: viewController) { showSourceOptions(anchor: anchor) }
     }
 
     /// Convenience async overload supporting `sourceView`.
@@ -290,96 +326,147 @@ public final class PhotoCaptureManager: NSObject {
 
     /// Directly launches the camera asynchronously.
     public func capturePhoto(from viewController: UIViewController) async -> PhotoCaptureResult {
-        await withCheckedContinuation { continuation in
-            capturePhoto(from: viewController) { result in
-                continuation.resume(returning: result)
-            }
-        }
+        await performRequest(from: viewController) { requestCameraAccess() }
     }
 
     /// Directly launches the photo library picker asynchronously.
     public func pickPhoto(from viewController: UIViewController) async -> PhotoCaptureResult {
-        await withCheckedContinuation { continuation in
-            pickPhoto(from: viewController) { result in
-                continuation.resume(returning: result)
+        await performRequest(from: viewController) { requestPhotoLibraryAccess() }
+    }
+
+    // MARK: - Request Lifecycle
+
+    /// Starts a request and returns its ID, or reports `.requestAlreadyInProgress`
+    /// and returns `nil`.
+    private func beginRequest(
+        from viewController: UIViewController,
+        completion: @escaping (PhotoCaptureResult) -> Void
+    ) -> Int? {
+        guard self.completion == nil else {
+            completion(.failure(.requestAlreadyInProgress))
+            return nil
+        }
+        requestID += 1
+        presentingViewController = viewController
+        self.completion = completion
+        return requestID
+    }
+
+    /// Bridges a request to async/await, cancelling it if the calling task is cancelled.
+    private func performRequest(
+        from viewController: UIViewController,
+        start: () -> Void
+    ) async -> PhotoCaptureResult {
+        let handle = RequestHandle()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: .cancelled)
+                    return
+                }
+                handle.id = beginRequest(from: viewController) { continuation.resume(returning: $0) }
+                if handle.id != nil { start() }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                if let id = handle.id { self.cancelRequest(id) }
             }
         }
+    }
+
+    private func isActive(_ id: Int) -> Bool {
+        completion != nil && id == requestID && !isCancelling
+    }
+
+    /// Dismisses the request's UI before finishing with `.cancelled`, so the caller
+    /// can start a new request as soon as it resumes.
+    private func cancelRequest(_ id: Int) {
+        guard isActive(id) else { return }
+        isCancelling = true
+
+        if isDismissingActiveController {
+            // That dismissal's completion finishes the request.
+        } else if activeController == nil {
+            finish(.cancelled)
+        } else if isActiveControllerPresented {
+            dismissActiveController {}
+        }
+        // Otherwise it is still appearing; `didPresent(_:)` dismisses it, or the
+        // refusal check in `present(_:observingDismissal:)` finishes the request.
+    }
+
+    private func finish(_ result: PhotoCaptureResult) {
+        setImageLoading(false)
+        let callback = completion
+        completion = nil
+        presentingViewController = nil
+        activeController = nil
+        isActiveControllerPresented = false
+        isDismissingActiveController = false
+        isCancelling = false
+        callback?(result)
+    }
+
+    private func setImageLoading(_ isLoading: Bool) {
+        guard isLoadingImage != isLoading else { return }
+        isLoadingImage = isLoading
+        imageLoadingHandler?(isLoading)
+    }
+
+    // MARK: - Source Selection
+
+    private func showSourceOptions(anchor: PopoverAnchor?) {
+        guard let viewController = presentingViewController else {
+            finish(.cancelled)
+            return
+        }
+
+        let strings = configuration.strings
+        let sheet = UIAlertController(title: strings.selectPhotoTitle, message: nil, preferredStyle: .actionSheet)
+        sheet.view.tintColor = configuration.actionTintColor
+
+        if environment.isCameraAvailable() {
+            sheet.addAction(action(strings.takePhotoAction) { self.requestCameraAccess() })
+        }
+        sheet.addAction(action(strings.chooseFromLibraryAction) { self.requestPhotoLibraryAccess() })
+        sheet.addAction(action(strings.cancelAction, style: .cancel) { self.finish(.cancelled) })
+
+        // iPad popover anchor
+        if let popover = sheet.popoverPresentationController {
+            configurePopover(popover, anchor: anchor, fallbackIn: viewController.view)
+        }
+
+        // Observe dismissal to catch taps outside the iPad popover.
+        present(sheet, observingDismissal: true)
     }
 
     // MARK: - Camera Permission Flow
 
     private func requestCameraAccess() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        switch environment.cameraAuthorizationStatus() {
         case .authorized:
             presentCamera()
 
         case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-                Task { @MainActor [weak self] in
-                    if granted {
-                        self?.presentCamera()
-                    } else {
-                        self?.handleCameraPermissionDenied()
-                    }
+            let id = requestID
+            Task {
+                let granted = await environment.requestCameraAccess()
+                guard isActive(id) else { return }
+                if granted {
+                    presentCamera()
+                } else {
+                    showPermissionDeniedAlert(for: .camera)
                 }
             }
 
         case .denied:
-            handleCameraPermissionDenied()
+            showPermissionDeniedAlert(for: .camera)
 
         case .restricted:
             finish(.failure(.permissionRestricted))
 
         @unknown default:
-            finish(.failure(.cameraUnavailable))
-        }
-    }
-
-    private func handleCameraPermissionDenied() {
-        guard let vc = presentingViewController else {
             finish(.failure(.permissionDenied(source: .camera)))
-            return
-        }
-
-        if configuration.promptForPhotoLibraryIfCameraDenied {
-            // Offer photo library as fallback, plus Settings deep-link.
-            let alert = UIAlertController(
-                title: configuration.strings.cameraDeniedTitle,
-                message: configuration.strings.cameraDeniedWithLibraryFallbackMessage,
-                preferredStyle: .alert
-            )
-            alert.view.tintColor = configuration.actionTintColor
-
-            alert.addAction(UIAlertAction(title: configuration.strings.chooseFromLibraryAction, style: .default) { [weak self] _ in
-                self?.requestPhotoLibraryAccess()
-            })
-            alert.addAction(UIAlertAction(title: configuration.strings.openSettingsAction, style: .default) { [weak self] _ in
-                Self.openAppSettings()
-                self?.finish(.failure(.permissionDenied(source: .camera)))
-            })
-            alert.addAction(UIAlertAction(title: configuration.strings.cancelAction, style: .cancel) { [weak self] _ in
-                self?.finish(.cancelled)
-            })
-
-            vc.present(alert, animated: true)
-        } else {
-            // Just offer Settings deep-link.
-            let alert = UIAlertController(
-                title: configuration.strings.cameraDeniedTitle,
-                message: configuration.strings.cameraDeniedMessage,
-                preferredStyle: .alert
-            )
-            alert.view.tintColor = configuration.actionTintColor
-
-            alert.addAction(UIAlertAction(title: configuration.strings.openSettingsAction, style: .default) { [weak self] _ in
-                Self.openAppSettings()
-                self?.finish(.failure(.permissionDenied(source: .camera)))
-            })
-            alert.addAction(UIAlertAction(title: configuration.strings.cancelAction, style: .cancel) { [weak self] _ in
-                self?.finish(.failure(.permissionDenied(source: .camera)))
-            })
-
-            vc.present(alert, animated: true)
         }
     }
 
@@ -402,19 +489,20 @@ public final class PhotoCaptureManager: NSObject {
             presentPhotoLibraryPicker()
 
         case .notDetermined:
-            PHPhotoLibrary.requestAuthorization { [weak self] newStatus in
-                Task { @MainActor [weak self] in
-                    switch newStatus {
-                    case .authorized, .limited:
-                        self?.presentPhotoLibraryPicker()
-                    default:
-                        self?.handlePhotoLibraryPermissionDenied()
-                    }
+            let id = requestID
+            Task {
+                let status = await Self.requestLegacyPhotoLibraryAuthorization()
+                guard isActive(id) else { return }
+                switch status {
+                case .authorized, .limited:
+                    presentPhotoLibraryPicker()
+                default:
+                    showPermissionDeniedAlert(for: .photoLibrary)
                 }
             }
 
         case .denied:
-            handlePhotoLibraryPermissionDenied()
+            showPermissionDeniedAlert(for: .photoLibrary)
 
         case .restricted:
             finish(.failure(.permissionRestricted))
@@ -424,77 +512,174 @@ public final class PhotoCaptureManager: NSObject {
         }
     }
 
-    private func handlePhotoLibraryPermissionDenied() {
-        guard let vc = presentingViewController else {
-            finish(.failure(.permissionDenied(source: .photoLibrary)))
-            return
+    /// iOS 13 only. The handler runs on an arbitrary queue, so it is explicitly
+    /// `@Sendable` to keep it from inheriting main-actor isolation (which traps
+    /// at runtime in Swift 6).
+    private static func requestLegacyPhotoLibraryAuthorization() async -> PHAuthorizationStatus {
+        await withCheckedContinuation { continuation in
+            PHPhotoLibrary.requestAuthorization { @Sendable status in
+                continuation.resume(returning: status)
+            }
         }
+    }
 
-        let alert = UIAlertController(
-            title: configuration.strings.libraryDeniedTitle,
-            message: configuration.strings.libraryDeniedMessage,
-            preferredStyle: .alert
-        )
+    // MARK: - Permission Denied
+
+    /// Offers a Settings deep-link (and, for the camera, optionally the photo
+    /// library). Both Settings and Cancel finish with `.permissionDenied`.
+    private func showPermissionDeniedAlert(for source: PhotoSource) {
+        let strings = configuration.strings
+        let offersLibrary = source == .camera && configuration.promptForPhotoLibraryIfCameraDenied
+        let title: String
+        let message: String
+        switch source {
+        case .camera:
+            title = strings.cameraDeniedTitle
+            message = offersLibrary ? strings.cameraDeniedWithLibraryFallbackMessage : strings.cameraDeniedMessage
+        case .photoLibrary:
+            title = strings.libraryDeniedTitle
+            message = strings.libraryDeniedMessage
+        }
+        let denied = PhotoCaptureResult.failure(.permissionDenied(source: source))
+
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.view.tintColor = configuration.actionTintColor
 
-        alert.addAction(UIAlertAction(title: configuration.strings.openSettingsAction, style: .default) { [weak self] _ in
-            Self.openAppSettings()
-            self?.finish(.failure(.permissionDenied(source: .photoLibrary)))
+        if offersLibrary {
+            alert.addAction(action(strings.chooseFromLibraryAction) { self.requestPhotoLibraryAccess() })
+        }
+        alert.addAction(action(strings.openSettingsAction) {
+            self.environment.openSettings()
+            self.finish(denied)
         })
-        alert.addAction(UIAlertAction(title: configuration.strings.cancelAction, style: .cancel) { [weak self] _ in
-            self?.finish(.failure(.permissionDenied(source: .photoLibrary)))
-        })
+        alert.addAction(action(strings.cancelAction, style: .cancel) { self.finish(denied) })
 
-        vc.present(alert, animated: true)
+        present(alert)
     }
 
     // MARK: - Presenting Pickers
 
     private func presentCamera() {
-        guard UIImagePickerController.isSourceTypeAvailable(.camera) else {
+        guard environment.isCameraAvailable() else {
             finish(.failure(.cameraUnavailable))
-            return
-        }
-        guard let vc = presentingViewController else {
-            finish(.cancelled)
             return
         }
 
         let picker = UIImagePickerController()
         picker.sourceType = .camera
         picker.allowsEditing = configuration.allowsEditing
-        if UIImagePickerController.isCameraDeviceAvailable(configuration.preferredCameraDevice) {
+        if environment.isCameraDeviceAvailable(configuration.preferredCameraDevice) {
             picker.cameraDevice = configuration.preferredCameraDevice
         }
         picker.delegate = self
         picker.modalPresentationStyle = .fullScreen
-        vc.present(picker, animated: true)
+        present(picker)
     }
 
     private func presentPhotoLibraryPicker() {
-        guard let vc = presentingViewController else {
-            finish(.cancelled)
-            return
-        }
-
         if #available(iOS 14, *) {
             var config = PHPickerConfiguration()
             config.selectionLimit = 1
             config.filter = .images
             let picker = PHPickerViewController(configuration: config)
             picker.delegate = self
-            vc.present(picker, animated: true)
+            present(picker, observingDismissal: true)
         } else {
             let picker = UIImagePickerController()
             picker.sourceType = .photoLibrary
             picker.allowsEditing = configuration.allowsEditing
             picker.delegate = self
-            picker.presentationController?.delegate = self
-            vc.present(picker, animated: true)
+            present(picker, observingDismissal: true)
         }
     }
 
     // MARK: - Helpers
+
+    /// Presents `controller` for the active request. Finishes the request if the
+    /// presenter is gone or can't present right now, so it can never hang.
+    private func present(_ controller: UIViewController, observingDismissal: Bool = false) {
+        guard let presenter = presentingViewController else {
+            finish(.cancelled)
+            return
+        }
+        if observingDismissal {
+            controller.presentationController?.delegate = self
+        }
+
+        activeController = controller
+        isActiveControllerPresented = false
+        presentationID += 1
+        let id = presentationID
+        let accepted = environment.present(controller, presenter) { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            didPresent(controller)
+        }
+        guard accepted else {
+            activeController = nil
+            finish(.failure(.presentationFailed))
+            return
+        }
+
+        // UIKit also refuses, with only a log message, while the presenter is waiting
+        // for another deferred presentation. It then releases the controller, so the
+        // weakly held `activeController` goes nil before it ever appears; a deferred
+        // presentation that will still happen keeps it alive.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            guard let self, presentationID == id, completion != nil,
+                  activeController == nil, !isActiveControllerPresented else { return }
+            finish(isCancelling ? .cancelled : .failure(.presentationFailed))
+        }
+    }
+
+    private func didPresent(_ controller: UIViewController) {
+        guard controller === activeController else { return }
+        isActiveControllerPresented = true
+        if isCancelling {
+            // Cancelled while it was still appearing.
+            dismissActiveController {}
+        }
+    }
+
+    /// Dismisses `activeController`, then runs `next` if the request is still active.
+    /// If the request was cancelled meanwhile, finishes it with `.cancelled` instead.
+    private func dismissActiveController(then next: @escaping () -> Void) {
+        guard let controller = activeController else {
+            isCancelling ? finish(.cancelled) : next()
+            return
+        }
+        let id = requestID
+        isDismissingActiveController = true
+        environment.dismiss(controller) { [self] in
+            guard completion != nil, requestID == id else { return }
+            activeController = nil
+            isActiveControllerPresented = false
+            isDismissingActiveController = false
+            if isCancelling {
+                finish(.cancelled)
+            } else {
+                next()
+            }
+        }
+    }
+
+    /// Whether a delegate callback comes from the active picker and should be handled.
+    private func isActivePicker(_ picker: UIViewController) -> Bool {
+        picker === activeController && isActive(requestID) && !isDismissingActiveController
+    }
+
+    /// An alert action whose handler runs only if its request is still active.
+    private func action(
+        _ title: String,
+        style: UIAlertAction.Style = .default,
+        handler: @escaping () -> Void
+    ) -> UIAlertAction {
+        let id = requestID
+        return UIAlertAction(title: title, style: style) { [self] _ in
+            guard isActive(id) else { return }
+            handler()
+        }
+    }
 
     private func configurePopover(
         _ popover: UIPopoverPresentationController,
@@ -519,19 +704,6 @@ public final class PhotoCaptureManager: NSObject {
         }
     }
 
-    private static func openAppSettings() {
-        guard let url = URL(string: UIApplication.openSettingsURLString),
-              UIApplication.shared.canOpenURL(url) else { return }
-        UIApplication.shared.open(url)
-    }
-
-    private func finish(_ result: PhotoCaptureResult) {
-        let callback = self.completion
-        self.completion = nil
-        self.presentingViewController = nil
-        callback?(result)
-    }
-
     // MARK: - Public Utilities
 
     /// Converts a captured/picked `UIImage` to JPEG `Data` using
@@ -550,21 +722,19 @@ extension PhotoCaptureManager: UIImagePickerControllerDelegate, UINavigationCont
         _ picker: UIImagePickerController,
         didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
     ) {
-        picker.dismiss(animated: true) { [weak self] in
-            let image = (self?.configuration.allowsEditing == true ? info[.editedImage] as? UIImage : nil)
-                ?? (info[.originalImage] as? UIImage)
+        guard isActivePicker(picker) else { return }
+        let image = (configuration.allowsEditing ? info[.editedImage] as? UIImage : nil)
+            ?? (info[.originalImage] as? UIImage)
 
-            if let image {
-                self?.finish(.success(image))
-            } else {
-                self?.finish(.failure(.imageExtractionFailed))
-            }
+        dismissActiveController { [self] in
+            finish(image.map { .success($0) } ?? .failure(.imageExtractionFailed))
         }
     }
 
     public func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
-        picker.dismiss(animated: true) { [weak self] in
-            self?.finish(.cancelled)
+        guard isActivePicker(picker) else { return }
+        dismissActiveController { [self] in
+            finish(.cancelled)
         }
     }
 }
@@ -575,33 +745,47 @@ extension PhotoCaptureManager: UIImagePickerControllerDelegate, UINavigationCont
 extension PhotoCaptureManager: PHPickerViewControllerDelegate {
 
     public func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
-        picker.dismiss(animated: true) { [weak self] in
-            guard let self else { return }
+        guard isActivePicker(picker) else { return }
 
-            guard let provider = results.first?.itemProvider,
-                  provider.canLoadObject(ofClass: UIImage.self) else {
-                // User tapped Done without selecting anything → treat as cancel
-                if results.isEmpty {
-                    self.finish(.cancelled)
-                } else {
-                    self.finish(.failure(.imageExtractionFailed))
-                }
+        dismissActiveController { [self] in
+            // User tapped Cancel, or Done without selecting anything.
+            guard let provider = results.first?.itemProvider else {
+                finish(.cancelled)
                 return
             }
+            loadImage(from: provider, request: requestID)
+        }
+    }
 
-            provider.loadObject(ofClass: UIImage.self) { [weak self] object, error in
-                let image = object as? UIImage
-                let sendableError = error
-                Task { @MainActor [weak self] in
-                    if let sendableError {
-                        self?.finish(.failure(.unknown(sendableError)))
-                    } else if let image {
-                        self?.finish(.success(image))
-                    } else {
-                        self?.finish(.failure(.imageExtractionFailed))
-                    }
+    private func loadImage(from provider: NSItemProvider, request id: Int) {
+        let complete: @Sendable (UIImage?, (any Error)?) -> Void = { [self] image, error in
+            Task { @MainActor in
+                guard isActive(id) else { return }
+                if let image {
+                    finish(.success(image))
+                } else if let error {
+                    finish(.failure(.unknown(error)))
+                } else {
+                    finish(.failure(.imageExtractionFailed))
                 }
             }
+        }
+
+        if provider.canLoadObject(ofClass: UIImage.self) {
+            setImageLoading(true)
+            provider.loadObject(ofClass: UIImage.self) { @Sendable object, error in
+                complete(object as? UIImage, error)
+            }
+        } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+            // Formats UIImage can't load as an object (e.g. RAW): decode a file copy,
+            // which is deleted once this handler returns.
+            setImageLoading(true)
+            provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { @Sendable url, error in
+                let image = url.flatMap { try? Data(contentsOf: $0) }.flatMap(UIImage.init(data:))
+                complete(image, error)
+            }
+        } else {
+            finish(.failure(.imageExtractionFailed))
         }
     }
 }
@@ -612,6 +796,11 @@ extension PhotoCaptureManager: PHPickerViewControllerDelegate {
 /// an iPad popover) that bypass the normal completion-handler paths above.
 extension PhotoCaptureManager: UIAdaptivePresentationControllerDelegate {
     public func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        // Ignore anything but the active request's UI, e.g. a popover whose Cancel
+        // action already finished its request (and maybe started a new one).
+        // This also finishes a cancelled request whose UI the user swiped away.
+        guard completion != nil,
+              presentationController.presentedViewController === activeController else { return }
         finish(.cancelled)
     }
 }

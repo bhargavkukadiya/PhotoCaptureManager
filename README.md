@@ -1,6 +1,6 @@
 # PhotoCaptureManager
 
-[![Swift](https://img.shields.io/badge/Swift-5.9%20%7C%206.0-orange.svg?style=flat)](https://swift.org)
+[![Swift](https://img.shields.io/badge/Swift-6.0+-orange.svg?style=flat)](https://swift.org)
 [![Platform](https://img.shields.io/badge/Platforms-iOS%2013.0+-blue.svg?style=flat)](https://developer.apple.com/ios/)
 [![SPM](https://img.shields.io/badge/Swift_Package_Manager-compatible-brightgreen.svg?style=flat)](https://swift.org/package-manager/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat)](LICENSE)
@@ -11,7 +11,7 @@ A production-ready, privacy-first Swift library for taking photos with the camer
 
 ## ✨ Features
 
-- ⚡️ **Modern Concurrency** — Full `async/await` support and `@MainActor` / `Sendable` isolation for Swift 6 strict concurrency.
+- ⚡️ **Modern Concurrency** — Full `async/await` support (with task cancellation) and `@MainActor` / `Sendable` isolation, built in the Swift 6 language mode.
 - 🔄 **Completion Handler Support** — Backward-compatible callback APIs for existing projects.
 - 🔒 **Privacy-First** — Uses `PHPickerViewController` (iOS 14+) which runs out-of-process and requires **zero photo library permissions**.
 - 📱 **Graceful Fallbacks** — Automatic fallback to `UIImagePickerController` on iOS 13, plus simulator detection for camera-less environments.
@@ -27,8 +27,8 @@ A production-ready, privacy-first Swift library for taking photos with the camer
 | Item | Requirement |
 |:---|:---|
 | **iOS** | 13.0+ |
-| **Swift** | 5.9+ / 6.0 |
-| **Xcode** | 15.0+ |
+| **Swift** | 6.0+ |
+| **Xcode** | 16.0+ |
 | **Frameworks** | `UIKit`, `AVFoundation`, `Photos`, `PhotosUI` |
 
 ---
@@ -55,6 +55,8 @@ dependencies: [
 
 Drag and drop `Sources/PhotoCaptureManager/PhotoCaptureManager.swift` into your Xcode project.
 
+> **App extensions:** `PhotoCaptureManager` uses `UIApplication.shared` to open Settings, so it can't be used in app extension targets.
+
 ---
 
 ## 🛠 Info.plist Keys
@@ -65,10 +67,6 @@ Add the required usage descriptions to your app's `Info.plist`:
 <!-- Required for Camera capture -->
 <key>NSCameraUsageDescription</key>
 <string>We need camera access to capture profile photos.</string>
-
-<!-- Required only if saving photos back to the user's library -->
-<key>NSPhotoLibraryAddUsageDescription</key>
-<string>We need permission to save photos to your photo library.</string>
 ```
 
 > **Note on `NSPhotoLibraryUsageDescription`:**
@@ -104,12 +102,14 @@ final class ProfileViewController: UIViewController {
                 break // User dismissed the picker
 
             case .failure(let error):
-                self.showErrorAlert(error.localizedDescription)
+                print("Capture failed: \(error.localizedDescription)")
             }
         }
     }
 }
 ```
+
+Cancelling the surrounding `Task` dismisses any picker or alert still on screen and returns `.cancelled` once it is gone, so you can start a new request right away.
 
 ### 2. Completion Handlers
 
@@ -190,6 +190,20 @@ case .success(let image):
     }
 ```
 
+### Loading Indicator
+
+After the user picks a photo, the picker closes before the image finishes loading (it may have to be downloaded from iCloud). Use `imageLoadingHandler` to show progress meanwhile:
+
+```swift
+PhotoCaptureManager.shared.imageLoadingHandler = { [weak self] isLoading in
+    isLoading ? self?.spinner.startAnimating() : self?.spinner.stopAnimating()
+}
+```
+
+### Permission Denied
+
+When camera or (on iOS 13) photo library access is denied, an alert offers a Settings deep-link. For the camera it can also offer the photo library instead (see `promptForPhotoLibraryIfCameraDenied`). Tapping **Open Settings** or **Cancel** in that alert finishes with `.failure(.permissionDenied(source:))`.
+
 ---
 
 ## ⚙️ Configuration & Localization
@@ -234,18 +248,30 @@ PhotoCaptureManager.shared.configuration = config
 ```swift
 switch error {
 case .cameraUnavailable:
-    // Device has no camera (e.g. iOS Simulator)
+    print("Device has no camera (e.g. iOS Simulator)")
 case .permissionDenied(let source):
-    // Access denied for .camera or .photoLibrary
+    print("Access denied for \(source)")
 case .permissionRestricted:
-    // Device restricted by parental controls / MDM
+    print("Device restricted by parental controls / MDM")
 case .imageExtractionFailed:
-    // Selected item could not be converted to UIImage
+    print("Selected item could not be converted to UIImage")
 case .requestAlreadyInProgress:
-    // Another capture request is currently active
+    print("Another capture request is currently active")
+case .presentationFailed:
+    print("The presenting view controller is off-screen or already presenting something")
 case .unknown(let error):
-    // Underlying system or item provider error
+    print("Underlying system or item provider error: \(error)")
 }
+```
+
+---
+
+## 🧪 Running Tests
+
+The package depends on UIKit, so `swift test` on macOS won't work. Run the tests on an iOS Simulator instead, replacing the device name with one installed on your Mac (`xcrun simctl list devices available`):
+
+```bash
+xcodebuild test -scheme PhotoCaptureManager -destination 'platform=iOS Simulator,name=iPhone 16'
 ```
 
 ---

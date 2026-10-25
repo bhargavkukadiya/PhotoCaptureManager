@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -17,17 +17,12 @@ let package = Package(
     targets: [
         .target(
             name: "PhotoCaptureManager",
-            dependencies: [],
-            swiftSettings: [
-                .enableUpcomingFeature("StrictConcurrency")
-            ]
+            dependencies: []
         ),
         .testTarget(
             name: "PhotoCaptureManagerTests",
-            dependencies: ["PhotoCaptureManager"],
-            swiftSettings: [
-                .enableUpcomingFeature("StrictConcurrency")
-            ]
+            dependencies: ["PhotoCaptureManager"]
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )
